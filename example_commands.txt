@@ -1,0 +1,28 @@
+# Bridge System - Example Commands
+# Lines starting with # are comments and ignored
+
+# System information
+uname -a
+whoami
+hostname
+pwd
+
+# Disk and memory
+df -h
+free -h
+
+# Network
+ip addr show
+ping -c 1 google.com
+
+# Processes
+ps aux | head -20
+top -bn1 | head -10
+
+# Files
+ls -la ~
+find /tmp -type f -name "*.log" 2>/dev/null | head -10
+
+# Environment
+env | grep -i path
+cat /etc/os-release
