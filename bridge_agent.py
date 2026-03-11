@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Bridge Agent v4.0 - Stable, Efficient & AI-Friendly
+Bridge Agent v5.0 - Multi-Agent Orchestration
 Run this on the target machine (e.g., WSL, remote server, Windows)
 
 Features:
+- Multi-agent support with agent_id, concurrency limiter, mission workspaces
 - Command execution with cwd, env, timeout control
-- Background process execution + poll for output
+- Background process execution + poll with smart hints
 - File: upload, download (chunked), read text, write text
 - Filesystem: list, stat, mkdir, delete, move
+- Mission system with pre-built agent prompts
 - Session logging to .jsonl
 - Stats tracking (uptime, request count, bytes)
 - Shell auto-detection
 - Gzip compression for large responses
 - Optional API key authentication
-- Beautiful colored output
+- Beautiful colored output with agent tags
 """
 
 import http.server
@@ -30,8 +32,11 @@ import base64
 import hashlib
 import shutil
 import threading
+import re
+from collections import deque
 from io import BytesIO
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 import socket
 import platform
 
@@ -46,8 +51,42 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT = 60
 MAX_OUTPUT_SIZE = 10 * 1024 * 1024   # 10MB
+MAX_CONCURRENT_BG = 2                # max simultaneous bg processes
 API_KEY = None
 START_TIME = time.time()
+MISSIONS_DIR = None  # set in main()
+
+# ==================== CONCURRENCY ====================
+_bg_semaphore = None  # set in main() after parsing --max-concurrent
+_bg_queue = deque()   # track queued commands for position info
+_bg_queue_lock = threading.Lock()
+
+def get_queue_position():
+    with _bg_queue_lock:
+        return len(_bg_queue)
+
+# ==================== AGENT COLORS ====================
+AGENT_COLORS = [
+    '\033[96m',   # cyan
+    '\033[93m',   # yellow
+    '\033[92m',   # green
+    '\033[95m',   # magenta
+    '\033[94m',   # blue
+    '\033[91m',   # red
+]
+_agent_color_map = {}
+_agent_color_idx = 0
+
+def agent_tag(agent_id):
+    """Return colored agent tag for terminal display."""
+    global _agent_color_idx
+    if not agent_id:
+        return ""
+    if agent_id not in _agent_color_map:
+        _agent_color_map[agent_id] = AGENT_COLORS[_agent_color_idx % len(AGENT_COLORS)]
+        _agent_color_idx += 1
+    c = _agent_color_map[agent_id]
+    return f"{c}[{agent_id}]{Color.RESET} "
 
 # ==================== STATS ====================
 class Stats:
@@ -94,23 +133,57 @@ def session_log(entry: dict):
 
 # ==================== BACKGROUND PROCESSES ====================
 _bg_lock = threading.Lock()
-_bg_processes: dict = {}   # pid (str) -> {"proc", "stdout", "stderr", "started", "cmd"}
+_bg_processes: dict = {}   # pid (str) -> info dict
 
-def _bg_reader(pid_key: str, proc: subprocess.Popen):
-    """Background thread that drains stdout/stderr of a background process."""
+def _bg_worker(pid_key: str, command: str, cwd, env):
+    """Worker that waits for semaphore slot, then runs the command."""
+    run_env = None
+    if env:
+        run_env = os.environ.copy()
+        run_env.update({str(k): str(v) for k, v in env.items()})
+
+    # Mark as queued until we get a slot
+    with _bg_lock:
+        _bg_processes[pid_key]["status"] = "queued"
+
+    # Wait for semaphore slot (concurrency limiter)
+    if _bg_semaphore:
+        _bg_semaphore.acquire()
+
+    with _bg_lock:
+        if pid_key not in _bg_processes:
+            if _bg_semaphore: _bg_semaphore.release()
+            return
+        _bg_processes[pid_key]["status"] = "running"
+        _bg_processes[pid_key]["started_running"] = time.time()
+
     try:
+        proc = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=cwd, env=run_env
+        )
+        with _bg_lock:
+            _bg_processes[pid_key]["proc"] = proc
+            _bg_processes[pid_key]["real_pid"] = proc.pid
+
         out, err = proc.communicate()
         with _bg_lock:
             if pid_key in _bg_processes:
-                _bg_processes[pid_key]["stdout"] += out
-                _bg_processes[pid_key]["stderr"] += err
+                _bg_processes[pid_key]["stdout"] = out
+                _bg_processes[pid_key]["stderr"] = err
                 _bg_processes[pid_key]["done"] = True
+                _bg_processes[pid_key]["status"] = "done"
                 _bg_processes[pid_key]["returncode"] = proc.returncode
     except Exception as e:
         with _bg_lock:
             if pid_key in _bg_processes:
                 _bg_processes[pid_key]["done"] = True
+                _bg_processes[pid_key]["status"] = "error"
                 _bg_processes[pid_key]["error"] = str(e)
+    finally:
+        if _bg_semaphore:
+            _bg_semaphore.release()
+
 
 # ==================== COLORS ====================
 class Color:
@@ -194,7 +267,7 @@ def print_banner(port: int, auth_enabled: bool):
     ip = get_local_ip()
     auth_s = Color.color("ENABLED", Color.BRIGHT_GREEN) if auth_enabled else Color.color("DISABLED", Color.BRIGHT_RED)
     div = Color.dim('=' * 42)
-    print(f"\n  {Color.BRIGHT_CYAN}{Color.BOLD}BRIDGE AGENT{Color.RESET} {Color.dim('v4.0')}")
+    print(f"\n  {Color.BRIGHT_CYAN}{Color.BOLD}BRIDGE AGENT{Color.RESET} {Color.dim('v5.0')}")
     print(f"  {div}")
     print(f"  {Color.bold('Status:')}    {Color.badge('ONLINE', Color.BG_GREEN + Color.BLACK)}")
     print(f"  {Color.bold('Address:')}   {Color.BRIGHT_YELLOW}http://{ip}:{port}{Color.RESET}")
@@ -237,27 +310,24 @@ class CommandExecutor:
         except Exception as e:
             return {"error": str(e), "returncode": -1}
 
-    def execute_background(self, command, cwd=None, env=None):
-        """Start command in background, return pid key."""
-        run_env = None
-        if env:
-            run_env = os.environ.copy()
-            run_env.update({str(k): str(v) for k, v in env.items()})
-        proc = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=cwd, env=run_env
-        )
-        pid_key = str(proc.pid)
+    def execute_background(self, command, cwd=None, env=None, agent_id=None):
+        """Start command in background with concurrency limiting. Returns job_id immediately."""
+        import uuid
+        job_id = str(uuid.uuid4())[:8]
         with _bg_lock:
-            _bg_processes[pid_key] = {
-                "proc": proc, "cmd": command,
+            _bg_processes[job_id] = {
+                "cmd": command, "proc": None,
                 "stdout": "", "stderr": "",
                 "done": False, "returncode": None,
-                "started": time.time()
+                "status": "queued",
+                "started": time.time(),
+                "started_running": None,
+                "agent_id": agent_id,
+                "cwd": cwd
             }
-        t = threading.Thread(target=_bg_reader, args=(pid_key, proc), daemon=True)
+        t = threading.Thread(target=_bg_worker, args=(job_id, command, cwd, env), daemon=True)
         t.start()
-        return pid_key
+        return job_id
 
 
 # ==================== HTTP HANDLER ====================
@@ -322,7 +392,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {
                 "type": "remote-terminal-bridge",
                 "status": "online",
-                "version": "4.0",
+                "version": "5.0",
                 "timestamp": time.time(),
                 "auth_enabled": API_KEY is not None,
                 "host": {
@@ -368,7 +438,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Bridge Agent v4.0</title>
+<title>Bridge Agent v5.0</title>
 <style>
   body {{ font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 2rem; }}
   h1 {{ color: #58a6ff; margin-bottom: 0; }}
@@ -497,6 +567,7 @@ curl -s -X POST {url}/ -H "Content-Type: application/json" \\
                 "upload":   self._handle_upload,
                 "download": self._handle_download,
                 "stats":    self._handle_stats,
+                "mission":  self._handle_mission,
             }
             handler = dispatch.get(action)
             if handler:
@@ -515,13 +586,14 @@ curl -s -X POST {url}/ -H "Content-Type: application/json" \\
     # ---------- EXEC ----------
     def _handle_exec(self, data):
         cmd = data.get("command", "")
+        aid = data.get("agent_id", "")
         if not cmd:
             self.send_json(400, {"error": "No command"}); return
         timeout = min(data.get("timeout", DEFAULT_TIMEOUT), 300)
         cwd = data.get("cwd") or None
         env = data.get("env") or None
         cwd_hint = f" {Color.dim('@ ' + cwd)}" if cwd else ""
-        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {Color.CMD}EXEC{Color.RESET} {Color.bold(cmd)}{cwd_hint}")
+        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {agent_tag(aid)}{Color.CMD}EXEC{Color.RESET} {Color.bold(cmd)}{cwd_hint}")
         t0 = time.time()
         result = self.executor.execute(cmd, timeout, cwd=cwd, env=env)
         elapsed = time.time() - t0
@@ -532,53 +604,86 @@ curl -s -X POST {url}/ -H "Content-Type: application/json" \\
                   else Color.color("TIMEOUT", Color.BRIGHT_YELLOW) if result.get("timeout")
                   else Color.color(f"FAIL:{rc}", Color.BRIGHT_RED))
         print(f"           {status} {Color.dim(format_size(out_size))} {Color.dim('|')} {Color.dim(format_duration(elapsed))}")
-        session_log({"action": "exec", "cmd": cmd, "cwd": cwd, "rc": rc, "elapsed": round(elapsed, 3)})
+        session_log({"action": "exec", "cmd": cmd, "cwd": cwd, "rc": rc, "elapsed": round(elapsed, 3), "agent_id": aid})
         self.send_json(200, result, compress=True)
 
     # ---------- BACKGROUND ----------
     def _handle_bg(self, data):
         cmd = data.get("command", "")
+        aid = data.get("agent_id", "")
         if not cmd:
             self.send_json(400, {"error": "No command"}); return
         cwd = data.get("cwd") or None
         env = data.get("env") or None
         cwd_hint = f" {Color.dim('@ ' + cwd)}" if cwd else ""
-        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {Color.WARN}BG  {Color.RESET} {Color.bold(cmd)}{cwd_hint}")
+        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {agent_tag(aid)}{Color.WARN}BG  {Color.RESET} {Color.bold(cmd)}{cwd_hint}")
         try:
-            pid = self.executor.execute_background(cmd, cwd=cwd, env=env)
+            job_id = self.executor.execute_background(cmd, cwd=cwd, env=env, agent_id=aid)
             Stats.inc(commands_run=1)
-            session_log({"action": "bg", "cmd": cmd, "pid": pid})
-            self.send_json(200, {"pid": pid, "status": "running", "command": cmd})
+            # Count running bg processes for hint
+            with _bg_lock:
+                running = sum(1 for p in _bg_processes.values() if p.get('status') == 'running')
+                queued = sum(1 for p in _bg_processes.values() if p.get('status') == 'queued')
+            hint = f"This command is running in the background. Poll with action='poll', job_id='{job_id}' to check output."
+            if queued > 0:
+                hint += f" Currently {running} processes running, {queued} queued (max concurrent: {MAX_CONCURRENT_BG}). Your command may wait before starting."
+            hint += f" Suggested: poll again in 10-30 seconds."
+            session_log({"action": "bg", "cmd": cmd, "job_id": job_id, "agent_id": aid})
+            self.send_json(200, {
+                "job_id": job_id,
+                "status": "queued",
+                "command": cmd,
+                "running_count": running,
+                "queued_count": queued,
+                "max_concurrent": MAX_CONCURRENT_BG,
+                "poll_after_seconds": 10,
+                "hint": hint
+            })
         except Exception as e:
             Stats.inc(errors=1)
             self.send_json(500, {"error": str(e)})
 
     # ---------- POLL ----------
     def _handle_poll(self, data):
-        pid = str(data.get("pid", ""))
+        job_id = str(data.get("job_id", data.get("pid", "")))
         kill = data.get("kill", False)
-        if not pid:
-            self.send_json(400, {"error": "No pid"}); return
+        aid = data.get("agent_id", "")
+        if not job_id:
+            self.send_json(400, {"error": "No job_id (or pid)"}); return
         with _bg_lock:
-            proc_info = _bg_processes.get(pid)
+            proc_info = _bg_processes.get(job_id)
         if not proc_info:
-            self.send_json(404, {"error": f"No background process with pid={pid}"}); return
-        if kill and not proc_info.get("done"):
+            self.send_json(404, {"error": f"No background job '{job_id}'. Use 'bg' action to start one."}); return
+        if kill and not proc_info.get("done") and proc_info.get("proc"):
             try:
                 proc_info["proc"].terminate()
-                print(f"  {Color.TIME}[{ts()}]{Color.RESET} {Color.WARN}KILL{Color.RESET} pid={pid}")
+                print(f"  {Color.TIME}[{ts()}]{Color.RESET} {agent_tag(aid)}{Color.WARN}KILL{Color.RESET} job={job_id}")
             except Exception:
                 pass
+        status = proc_info.get("status", "unknown")
         done = proc_info.get("done", False)
-        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {Color.INFO}POLL{Color.RESET} pid={pid} {'done' if done else 'running'}")
+        elapsed = round(time.time() - proc_info.get("started", time.time()), 2)
+        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {agent_tag(aid)}{Color.INFO}POLL{Color.RESET} job={job_id} {status}")
+        # Smart hint
+        if done:
+            hint = "Command finished. You can read the stdout/stderr from this response."
+        elif status == "queued":
+            with _bg_lock:
+                running = sum(1 for p in _bg_processes.values() if p.get('status') == 'running')
+            hint = f"Command is queued ({running}/{MAX_CONCURRENT_BG} slots busy). Poll again in 15-30 seconds."
+        else:
+            hint = f"Command is running ({elapsed}s elapsed). Poll again in 10-20 seconds to check progress."
         self.send_json(200, {
-            "pid": pid,
+            "job_id": job_id,
             "command": proc_info.get("cmd"),
+            "status": status,
             "stdout": proc_info.get("stdout", ""),
             "stderr": proc_info.get("stderr", ""),
             "done": done,
             "returncode": proc_info.get("returncode"),
-            "elapsed": round(time.time() - proc_info.get("started", time.time()), 2)
+            "elapsed": elapsed,
+            "poll_after_seconds": 0 if done else (20 if status == 'queued' else 10),
+            "hint": hint
         }, compress=True)
 
     # ---------- LIST ----------
@@ -797,10 +902,50 @@ curl -s -X POST {url}/ -H "Content-Type: application/json" \\
             self.send_json(500, {"error": str(e)})
 
     # ---------- STATS ----------
-    def _handle_stats(self, _data):
+    def _handle_stats(self, data):
+        aid = data.get("agent_id", "") if isinstance(data, dict) else ""
         snap = Stats.snapshot()
-        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {Color.INFO}STAT{Color.RESET} {Color.dim('server stats requested')}")
+        # add bg process info
+        with _bg_lock:
+            snap["bg_running"] = sum(1 for p in _bg_processes.values() if p.get('status') == 'running')
+            snap["bg_queued"] = sum(1 for p in _bg_processes.values() if p.get('status') == 'queued')
+            snap["max_concurrent"] = MAX_CONCURRENT_BG
+        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {agent_tag(aid)}{Color.INFO}STAT{Color.RESET} {Color.dim('server stats')}")
         self.send_json(200, snap)
+
+    # ---------- MISSION ----------
+    def _handle_mission(self, data):
+        """Create or list mission workspaces."""
+        target = data.get("target", "")
+        aid = data.get("agent_id", "")
+        if not target:
+            # List existing missions
+            if MISSIONS_DIR and os.path.exists(MISSIONS_DIR):
+                missions = [d for d in os.listdir(MISSIONS_DIR) if os.path.isdir(os.path.join(MISSIONS_DIR, d))]
+            else:
+                missions = []
+            self.send_json(200, {"missions": missions, "missions_dir": MISSIONS_DIR or "not configured"})
+            return
+
+        # Sanitize target name for folder
+        safe_target = re.sub(r'[^a-zA-Z0-9._-]', '_', target)
+        base = MISSIONS_DIR or os.path.join(os.getcwd(), "missions")
+        mission_path = os.path.join(base, safe_target)
+
+        # Create workspace structure
+        subdirs = ["recon", "endpoints", "vulns", "reports", "signals", "loot"]
+        for d in subdirs:
+            os.makedirs(os.path.join(mission_path, d), exist_ok=True)
+
+        workspace = {d: os.path.join(mission_path, d) for d in subdirs}
+        workspace["root"] = mission_path
+
+        print(f"  {Color.TIME}[{ts()}]{Color.RESET} {agent_tag(aid)}{Color.SUCCESS}MISSION{Color.RESET} {Color.bold(target)} -> {mission_path}")
+        self.send_json(200, {
+            "target": target,
+            "workspace": workspace,
+            "hint": f"Workspace created at {mission_path}. Use cwd parameter to run commands inside the workspace. Drop signal files in 'signals/' to coordinate with other agents."
+        })
 
     # ---------- OPTIONS ----------
     def do_OPTIONS(self):
@@ -824,15 +969,18 @@ def signal_handler(signum, frame):
 
 
 def main():
-    global API_KEY, LOG_FILE
+    global API_KEY, LOG_FILE, MISSIONS_DIR, MAX_CONCURRENT_BG, _bg_semaphore
 
     if not sys.stdout.isatty():
         Color.disable()
 
-    parser = argparse.ArgumentParser(description="Bridge Agent v4.0 - Remote Terminal Bridge")
+    parser = argparse.ArgumentParser(description="Bridge Agent v5.0 - Multi-Agent Orchestration")
     parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT)
     parser.add_argument("--api-key", "-k", type=str, default=None)
     parser.add_argument("--log", "-l", type=str, default=None, help="Session log file (.jsonl)")
+    parser.add_argument("--max-concurrent", "-c", type=int, default=MAX_CONCURRENT_BG,
+                        help=f"Max concurrent bg processes (default: {MAX_CONCURRENT_BG})")
+    parser.add_argument("--missions-dir", type=str, default=None, help="Base directory for mission workspaces")
     parser.add_argument("--no-color", action="store_true")
     args = parser.parse_args()
 
@@ -841,6 +989,9 @@ def main():
 
     API_KEY = args.api_key or os.environ.get("BRIDGE_API_KEY")
     LOG_FILE = args.log or os.environ.get("BRIDGE_LOG_FILE")
+    MAX_CONCURRENT_BG = args.max_concurrent
+    _bg_semaphore = threading.Semaphore(MAX_CONCURRENT_BG)
+    MISSIONS_DIR = args.missions_dir or os.environ.get("BRIDGE_MISSIONS_DIR") or os.path.join(os.getcwd(), "missions")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
