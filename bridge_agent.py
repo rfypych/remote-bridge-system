@@ -380,58 +380,67 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
 
         Stats.inc(requests=1)
 
-        if BridgeHandler._detected_shells is None:
-            BridgeHandler._detected_shells = detect_shells()
+        try:
+            if BridgeHandler._detected_shells is None:
+                BridgeHandler._detected_shells = detect_shells()
 
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        params = parse_qs(parsed.query)
-        accept = self.headers.get("Accept", "")
-        is_browser = "text/html" in accept
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+            params = parse_qs(parsed.query)
+            accept = self.headers.get("Accept", "")
+            is_browser = "text/html" in accept
 
-        if path == "/mission":
-            target = params.get("target", [""])[0]
-            self._send_mission_dashboard(target)
-        elif path == "/" and is_browser:
-            self._send_html_landing()
-        elif path == "/":
-            print(f"  {Color.TIME}[{ts()}]{Color.RESET} {Color.SUCCESS}GET{Color.RESET}  {Color.dim('/ - Health Check (JSON)')}")
-            self.send_json(200, {
-                "type": "remote-terminal-bridge",
-                "status": "online",
-                "version": "5.0",
-                "timestamp": time.time(),
-                "auth_enabled": API_KEY is not None,
-                "host": {
-                    "os": f"{platform.system()} {platform.release()}",
-                    "hostname": socket.gethostname(),
-                    "cwd": os.getcwd(),
-                    "python": sys.version.split()[0],
-                    "shells": BridgeHandler._detected_shells
-                },
-                "capabilities": [
-                    "exec", "bg", "poll",
-                    "list", "stat", "read", "write", "mkdir", "delete", "move",
-                    "upload", "download", "stats", "mission"
-                ],
-                "usage": {
-                    "exec": {"body": {"action": "exec", "command": "...", "agent_id": "(opt)", "cwd": "(opt)", "env": {}, "timeout": 60}, "description": "Run command synchronously. Returns stdout/stderr/returncode."},
-                    "bg":   {"body": {"action": "bg", "command": "...", "agent_id": "(opt)", "cwd": "(opt)"}, "description": "Run command in background. Returns job_id + smart hints (poll_after_seconds, queue status). Use poll to check output."},
-                    "poll": {"body": {"action": "poll", "job_id": "<id>", "kill": False}, "description": "Poll background job output. Returns status (queued/running/done), stdout, hint, poll_after_seconds."},
-                    "list": {"body": {"action": "list", "path": "."}, "description": "List directory. Returns entries with name/type/size/modified/path."},
-                    "stat": {"body": {"action": "stat", "path": "<path>"}, "description": "Get detailed info about a file or directory (size, hash, mtime, etc)."},
-                    "read": {"body": {"action": "read", "path": "<path>", "encoding": "utf-8"}, "description": "Read text file content directly (no base64)."},
-                    "write": {"body": {"action": "write", "path": "<path>", "content": "...", "mode": "write|append"}, "description": "Write text to file (no base64)."},
-                    "mkdir": {"body": {"action": "mkdir", "path": "<path>"}, "description": "Create directory (including parents)."},
-                    "delete": {"body": {"action": "delete", "path": "<path>", "recursive": False}, "description": "Delete file or directory."},
-                    "move":  {"body": {"action": "move", "src": "<path>", "dst": "<path>"}, "description": "Move or rename file/directory."},
-                    "upload":   {"body": {"action": "upload", "filename": "<path>", "data": "<base64>", "mode": "write|append"}, "description": "Upload binary file via base64."},
-                    "download": {"body": {"action": "download", "filename": "<path>", "offset": 0, "chunk_size": 1048576}, "description": "Download file as base64 (chunked)."},
-                    "stats": {"body": {"action": "stats"}, "description": "Get server stats: uptime, request count, bg queue info."},
-                    "mission": {"body": {"action": "mission", "target": "example.com"}, "description": "Create mission workspace with recon/endpoints/vulns/reports/signals/loot subdirectories."}
-                },
-                "hint": "POST to / with JSON body. Add agent_id to tag your requests (multi-agent support)."
-            })
+            if path == "/mission":
+                target = params.get("target", [""])[0]
+                self._send_mission_dashboard(target)
+            elif path == "/" and is_browser:
+                self._send_html_landing()
+            elif path == "/":
+                print(f"  {Color.TIME}[{ts()}]{Color.RESET} {Color.SUCCESS}GET{Color.RESET}  {Color.dim('/ - Health Check (JSON)')}")
+                self.send_json(200, {
+                    "type": "remote-terminal-bridge",
+                    "status": "online",
+                    "version": "5.0",
+                    "timestamp": time.time(),
+                    "auth_enabled": API_KEY is not None,
+                    "host": {
+                        "os": f"{platform.system()} {platform.release()}",
+                        "hostname": socket.gethostname(),
+                        "cwd": os.getcwd(),
+                        "python": sys.version.split()[0],
+                        "shells": BridgeHandler._detected_shells
+                    },
+                    "capabilities": [
+                        "exec", "bg", "poll",
+                        "list", "stat", "read", "write", "mkdir", "delete", "move",
+                        "upload", "download", "stats", "mission"
+                    ],
+                    "usage": {
+                        "exec": {"body": {"action": "exec", "command": "...", "agent_id": "(opt)", "cwd": "(opt)", "env": {}, "timeout": 60}, "description": "Run command synchronously. Returns stdout/stderr/returncode."},
+                        "bg":   {"body": {"action": "bg", "command": "...", "agent_id": "(opt)", "cwd": "(opt)"}, "description": "Run command in background. Returns job_id + smart hints (poll_after_seconds, queue status). Use poll to check output."},
+                        "poll": {"body": {"action": "poll", "job_id": "<id>", "kill": False}, "description": "Poll background job output. Returns status (queued/running/done), stdout, hint, poll_after_seconds."},
+                        "list": {"body": {"action": "list", "path": "."}, "description": "List directory. Returns entries with name/type/size/modified/path."},
+                        "stat": {"body": {"action": "stat", "path": "<path>"}, "description": "Get detailed info about a file or directory (size, hash, mtime, etc)."},
+                        "read": {"body": {"action": "read", "path": "<path>", "encoding": "utf-8"}, "description": "Read text file content directly (no base64)."},
+                        "write": {"body": {"action": "write", "path": "<path>", "content": "...", "mode": "write|append"}, "description": "Write text to file (no base64)."},
+                        "mkdir": {"body": {"action": "mkdir", "path": "<path>"}, "description": "Create directory (including parents)."},
+                        "delete": {"body": {"action": "delete", "path": "<path>", "recursive": False}, "description": "Delete file or directory."},
+                        "move":  {"body": {"action": "move", "src": "<path>", "dst": "<path>"}, "description": "Move or rename file/directory."},
+                        "upload":   {"body": {"action": "upload", "filename": "<path>", "data": "<base64>", "mode": "write|append"}, "description": "Upload binary file via base64."},
+                        "download": {"body": {"action": "download", "filename": "<path>", "offset": 0, "chunk_size": 1048576}, "description": "Download file as base64 (chunked)."},
+                        "stats": {"body": {"action": "stats"}, "description": "Get server stats: uptime, request count, bg queue info."},
+                        "mission": {"body": {"action": "mission", "target": "example.com"}, "description": "Create mission workspace with recon/endpoints/vulns/reports/signals/loot subdirectories."}
+                    },
+                    "hint": "POST to / with JSON body. Add agent_id to tag your requests (multi-agent support)."
+                })
+            else:
+                self.send_json(404, {"error": f"Unknown path: {path}. Try / or /mission?target=example.com"})
+        except Exception as e:
+            print(f"  {Color.ERROR}GET ERR{Color.RESET} {e}")
+            try:
+                self.send_json(500, {"error": f"Internal error: {e}"})
+            except Exception:
+                pass
 
     def _send_html_landing(self):
         """Return HTML landing page with full bridge instructions."""
@@ -439,7 +448,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         host_info = f"{socket.gethostname()} &bull; {platform.system()} {platform.release()}"
         cwd = os.getcwd().replace("\\", "\\\\")
         shells = ", ".join(BridgeHandler._detected_shells or ["unknown"])
-        url = f"http://{self.headers.get('Host', 'localhost')}"
+        host = self.headers.get('Host', 'localhost')
+        scheme = 'https' if 'trycloudflare.com' in host else 'http'
+        url = f"{scheme}://{host}"
         auth_note = "<b>Auth required:</b> Add header <code>Authorization: Bearer YOUR_KEY</code><br>" if API_KEY else ""
 
         html = f"""<!DOCTYPE html>
@@ -574,7 +585,10 @@ curl -s -X POST {url}/ -H "Content-Type: application/json" \\
     # ---------- MISSION DASHBOARD ----------
     def _send_mission_dashboard(self, target):
         """Serve mission dashboard with copy-paste agent prompts."""
-        url = f"http://{self.headers.get('Host', 'localhost')}"
+        # Detect scheme: if via tunnel (trycloudflare), use https
+        host = self.headers.get('Host', 'localhost')
+        scheme = 'https' if 'trycloudflare.com' in host or 'cloudflare' in host else 'http'
+        url = f"{scheme}://{host}"
         auth_header = f' -H "Authorization: Bearer YOUR_KEY"' if API_KEY else ''
         base = MISSIONS_DIR or os.path.join(os.getcwd(), 'missions')
         print(f"  {Color.TIME}[{ts()}]{Color.RESET} {Color.INFO}GET{Color.RESET}  {Color.dim(f'/mission?target={target} - Dashboard')}")
