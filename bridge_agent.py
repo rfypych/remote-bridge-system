@@ -273,7 +273,7 @@ def print_banner(port: int, auth_enabled: bool):
     print(f"  {Color.bold('Address:')}   {Color.BRIGHT_YELLOW}http://{ip}:{port}{Color.RESET}")
     print(f"  {Color.bold('Auth:')}      {auth_s}")
     print(f"  {div}")
-    print(f"  {Color.dim('Actions: exec, bg, poll, list, stat, read, write, mkdir, delete, move, upload, download, stats')}")
+    print(f"  {Color.dim('Actions: exec, bg, poll, list, stat, read, write, mkdir, delete, move, upload, download, stats, mission')}")
     print(f"  {div}\n")
 
 
@@ -405,12 +405,12 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 "capabilities": [
                     "exec", "bg", "poll",
                     "list", "stat", "read", "write", "mkdir", "delete", "move",
-                    "upload", "download", "stats"
+                    "upload", "download", "stats", "mission"
                 ],
                 "usage": {
-                    "exec": {"body": {"action": "exec", "command": "...", "cwd": "(opt)", "env": {}, "timeout": 60}, "description": "Run command synchronously. Returns stdout/stderr/returncode."},
-                    "bg":   {"body": {"action": "bg", "command": "...", "cwd": "(opt)", "env": {}}, "description": "Run command in background. Returns pid."},
-                    "poll": {"body": {"action": "poll", "pid": "<pid>", "kill": False}, "description": "Poll background process output. kill=true to terminate."},
+                    "exec": {"body": {"action": "exec", "command": "...", "agent_id": "(opt)", "cwd": "(opt)", "env": {}, "timeout": 60}, "description": "Run command synchronously. Returns stdout/stderr/returncode."},
+                    "bg":   {"body": {"action": "bg", "command": "...", "agent_id": "(opt)", "cwd": "(opt)"}, "description": "Run command in background. Returns job_id + smart hints (poll_after_seconds, queue status). Use poll to check output."},
+                    "poll": {"body": {"action": "poll", "job_id": "<id>", "kill": False}, "description": "Poll background job output. Returns status (queued/running/done), stdout, hint, poll_after_seconds."},
                     "list": {"body": {"action": "list", "path": "."}, "description": "List directory. Returns entries with name/type/size/modified/path."},
                     "stat": {"body": {"action": "stat", "path": "<path>"}, "description": "Get detailed info about a file or directory (size, hash, mtime, etc)."},
                     "read": {"body": {"action": "read", "path": "<path>", "encoding": "utf-8"}, "description": "Read text file content directly (no base64)."},
@@ -420,9 +420,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     "move":  {"body": {"action": "move", "src": "<path>", "dst": "<path>"}, "description": "Move or rename file/directory."},
                     "upload":   {"body": {"action": "upload", "filename": "<path>", "data": "<base64>", "mode": "write|append"}, "description": "Upload binary file via base64."},
                     "download": {"body": {"action": "download", "filename": "<path>", "offset": 0, "chunk_size": 1048576}, "description": "Download file as base64 (chunked)."},
-                    "stats": {"body": {"action": "stats"}, "description": "Get server stats: uptime, request count, bytes transferred."}
+                    "stats": {"body": {"action": "stats"}, "description": "Get server stats: uptime, request count, bg queue info."},
+                    "mission": {"body": {"action": "mission", "target": "example.com"}, "description": "Create mission workspace with recon/endpoints/vulns/reports/signals/loot subdirectories."}
                 },
-                "hint": "POST to / with JSON body to run commands or manage files on the host machine."
+                "hint": "POST to / with JSON body. Add agent_id to tag your requests (multi-agent support)."
             })
 
     def _send_html_landing(self):
@@ -488,9 +489,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
 <div class="card">
   <h2>&#9889; Available Actions</h2>
   <div class="grid">
-    <div class="action"><div class="name">exec</div><div class="desc">Run command synchronously (cwd, env, timeout)</div></div>
-    <div class="action"><div class="name">bg</div><div class="desc">Run command in background, returns pid</div></div>
-    <div class="action"><div class="name">poll</div><div class="desc">Get output of background process</div></div>
+    <div class="action"><div class="name">exec</div><div class="desc">Run command synchronously (cwd, env, timeout, agent_id)</div></div>
+    <div class="action"><div class="name">bg</div><div class="desc">Run in background, returns job_id + poll hints</div></div>
+    <div class="action"><div class="name">poll</div><div class="desc">Check bg job output (by job_id)</div></div>
     <div class="action"><div class="name">list</div><div class="desc">List directory contents</div></div>
     <div class="action"><div class="name">stat</div><div class="desc">File info: size, md5, modified date</div></div>
     <div class="action"><div class="name">read</div><div class="desc">Read text file (no base64)</div></div>
@@ -500,30 +501,32 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
     <div class="action"><div class="name">move</div><div class="desc">Move or rename file/folder</div></div>
     <div class="action"><div class="name">upload</div><div class="desc">Upload binary file (base64)</div></div>
     <div class="action"><div class="name">download</div><div class="desc">Download file as base64 (chunked)</div></div>
-    <div class="action"><div class="name">stats</div><div class="desc">Server uptime, request count, bytes</div></div>
+    <div class="action"><div class="name">stats</div><div class="desc">Server uptime, request count, bg queue</div></div>
+    <div class="action"><div class="name">mission</div><div class="desc">Create mission workspace (recon, vulns, signals...)</div></div>
   </div>
 </div>
 
 <div class="card">
   <h2>&#128196; Example curl commands</h2>
-<pre># Run a command
+<pre># Run a command (with agent_id for multi-agent)
 curl -s -X POST {url}/ -H "Content-Type: application/json" \\
-  -d '{{"action":"exec","command":"dir"}}'
+  -d '{{"action":"exec","command":"whoami","agent_id":"recon"}}'
 
-# List directory
+# Background process + poll (returns job_id)
 curl -s -X POST {url}/ -H "Content-Type: application/json" \\
-  -d '{{"action":"list","path":"."}}'
+  -d '{{"action":"bg","command":"nmap -sV target.com","agent_id":"recon"}}'
+# Response: {{"job_id": "a1b2c3d4", "poll_after_seconds": 10, "hint": "..."}}
+
+curl -s -X POST {url}/ -H "Content-Type: application/json" \\
+  -d '{{"action":"poll","job_id":"a1b2c3d4"}}'
+
+# Create mission workspace
+curl -s -X POST {url}/ -H "Content-Type: application/json" \\
+  -d '{{"action":"mission","target":"example.com"}}'
 
 # Read a file
 curl -s -X POST {url}/ -H "Content-Type: application/json" \\
-  -d '{{"action":"read","path":"README.md"}}'
-
-# Background process + poll
-curl -s -X POST {url}/ -H "Content-Type: application/json" \\
-  -d '{{"action":"bg","command":"npm run dev"}}' | python -c "import sys,json; print(json.load(sys.stdin)['pid'])"
-
-curl -s -X POST {url}/ -H "Content-Type: application/json" \\
-  -d '{{"action":"poll","pid":"<PID_HERE"}}'</pre>
+  -d '{{"action":"read","path":"README.md"}}'</pre>
 </div>
 
 </body>
